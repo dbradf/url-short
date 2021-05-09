@@ -11,7 +11,7 @@ get() {
 }
 
 workload() {
-    local reads=25
+    local reads=15
     local short=$(insert)
 
     i=0
