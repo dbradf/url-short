@@ -1,40 +1,99 @@
 use std::{collections::HashMap, error::Error, sync::Mutex};
 use harsh::Harsh;
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, http::header, web};
+use mongodb::{bson::doc, sync::{Client, Collection}};
+use serde::{Deserialize, Serialize};
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, http::header, post, web};
 
-#[derive(Clone)]
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ShortUrl {
+    index: i64,
+    url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Status {
+    last_index: i64,
+}
+
+struct MongoService {
+    url_collection: Collection<ShortUrl>,
+    status_collection: Collection<Status>,
+}
+
+impl MongoService {
+    pub async fn new(mongo_uri: &str) -> Self {
+        let client = Client::with_uri_str(mongo_uri).unwrap();
+        let database = client.database("urls");
+        let url_collection = database.collection::<ShortUrl>("urls");
+        let status_collection = database.collection::<Status>("status");
+
+        MongoService {
+            url_collection,
+            status_collection,
+        }
+    }
+
+    fn get_next_index(&self) -> i64 {
+        let next_index = self.status_collection.find_one_and_update(doc!{}, doc!{"$inc": { "last_index": 1 }}, None).unwrap();
+        if let Some(status) = next_index {
+            status.last_index
+        } else {
+            0
+        }
+    }
+
+    pub fn add_url(&self, url: &str) -> i64 {
+        let index = self.get_next_index();
+        self.url_collection.insert_one(ShortUrl {
+            index,
+            url: url.to_string(),
+        }, None).unwrap();
+
+        index
+    }
+
+    pub fn lookup_url(&self, index: i64) -> Option<String> {
+        let url = self.url_collection.find_one(doc! {"index": index}, None).unwrap();
+        url.map(|u| u.url)
+    }
+}
+
 struct ShortenerService {
     encoder: Harsh,
-    entries: HashMap<u64, String>,
-    next_index: u64,
+    mongo_service: MongoService,
+    cache: HashMap<i64, String>,
 }
 
 impl ShortenerService {
-    pub fn new() -> Result<Self, Box<dyn Error>> {
+    pub fn new(mongo_service: MongoService) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             encoder: Harsh::builder().salt("hello world").build().unwrap(),
-            entries: HashMap::new(),
-            next_index: 0,
+            mongo_service,
+            cache: HashMap::new(),
         })
     }
 
     pub fn add(&mut self, url: &str) -> String {
-        let index = self.next_index;
-        self.next_index += 1;
-        
-        let encoded = self.encoder.encode(&[index]);
-        self.entries.insert(index, format!("https://{}", url));
+        let index = self.mongo_service.add_url(&format!("https://{}", url));
 
-        println!("{:?}", self.entries);
-
-        encoded
+        self.encoder.encode(&[index as u64])
     }
 
-    pub fn lookup(&self, id: &str) -> Option<String> {
+    pub fn lookup(&mut self, id: &str) -> Option<String> {
         let index_result = self.encoder.decode(id);
         match index_result {
             Ok(index) => {
-                self.entries.get(&index[0]).map(|e| e.to_string())
+                let index = index[0] as i64;
+                if self.cache.contains_key(&index) {
+                    self.cache.get(&index).map(|u| u.to_string())
+                } else {
+                    let lookup = self.mongo_service.lookup_url(index);
+                    if let Some(url) = &lookup {
+                        self.cache.insert(index, url.to_string());
+                    }
+                    lookup
+                }
             }
             _ => None
         }
@@ -46,17 +105,22 @@ struct AppState {
 }
 
 
-#[get("/encode/{request_url}")]
-async fn add(web::Path(request_url): web::Path<String>, data: web::Data<AppState>) -> impl Responder {
+#[derive(Deserialize)]
+struct AddUrlRequest {
+    url: String,
+}
+
+#[post("/")]
+async fn add(add_url: web::Json<AddUrlRequest>, data: web::Data<AppState>) -> impl Responder {
     let mut shortener = data.shortener.lock().unwrap();
-    let encoded = shortener.add(&request_url);
+    let encoded = shortener.add(&add_url.url);
 
     HttpResponse::Ok().body(format!("{}", encoded))
 }
 
 #[get("/{request_hash}")]
 async fn find(web::Path(request_hash): web::Path<String>, data: web::Data<AppState>) -> impl Responder {
-    let shortener = data.shortener.lock().unwrap();
+    let mut shortener = data.shortener.lock().unwrap();
     let decoded = shortener.lookup(&request_hash);
 
     if let Some(url) = decoded {
@@ -70,7 +134,10 @@ async fn find(web::Path(request_hash): web::Path<String>, data: web::Data<AppSta
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let shortener = ShortenerService::new().unwrap();
+    let mongo_uri = std::env::args().nth(1).expect("Expected Mongo URI");
+
+    let mongoo_service = MongoService::new(&mongo_uri).await;
+    let shortener = ShortenerService::new(mongoo_service).unwrap();
     let app_state = web::Data::new(AppState {
         shortener: Mutex::new(shortener),
     });
